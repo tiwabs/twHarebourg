@@ -10,10 +10,47 @@
 
 using nlohmann::json;
 
-// Load the grid layout from a JSON config file.
-// The cell data is stored as a run-length encoded list of rows under
-// map.details: each entry is [row, col_start, col_end, type].
-// Cell types: 0 = non-existing, 1 = walkable, 2 = blocks line-of-sight.
+// Helper: decode the run-length "details" array into a MapData cell grid.
+static MapData LoadMapData(const json& jm) {
+    MapData m;
+    m.name = jm.value("name", "Map 1");
+    const auto& size = jm["size"];
+    m.rows = size[0].get<int>();
+    m.cols = size[1].get<int>();
+    m.cells.assign(m.rows, std::vector<int>(m.cols, 0));
+
+    for (const auto& d : jm["details"]) {
+        const int r  = d[0].get<int>();
+        const int c0 = d[1].get<int>();
+        const int c1 = d[2].get<int>();
+        const int t  = d[3].get<int>();
+        if (r < 0 || r >= m.rows) continue;
+        for (int c = std::max(0, c0); c <= c1 && c < m.cols; ++c)
+            m.cells[r][c] = t;
+    }
+    return m;
+}
+
+// Helper: encode a MapData cell grid back into the run-length "details" format.
+static json MakeDetails(const MapData& m) {
+    json details = json::array();
+    for (int r = 0; r < m.rows; ++r) {
+        int c = 0;
+        while (c < m.cols) {
+            if (m.cells[r][c] == 0) { ++c; continue; }
+            const int type = m.cells[r][c];
+            const int c0   = c;
+            while (c < m.cols && m.cells[r][c] == type) ++c;
+            details.push_back(json::array({r, c0, c - 1, type}));
+        }
+    }
+    return details;
+}
+
+// Load the grid from a JSON config file.
+// Supports both the legacy single-map format ("map" key) and the new
+// multi-map format ("maps" array). The calibration values (origin, tile
+// size, base resolution) are shared across all maps.
 bool Grid::LoadFromFile(const std::string& path) {
     std::ifstream in(path);
     if (!in) {
@@ -29,37 +66,42 @@ bool Grid::LoadFromFile(const std::string& path) {
         return false;
     }
 
-    baseW   = j.value("base_width", 1920);
-    baseH   = j.value("base_height", 1080);
+    baseW   = j.value("base_width",    1920);
+    baseH   = j.value("base_height",   1080);
     originX = j.value("grid_origin_x", 0);
     originY = j.value("grid_origin_y", 0);
-    tileW   = j.value("tile_w", 0);
-    tileH   = j.value("tile_h", 0);
+    tileW   = j.value("tile_w",        0);
+    tileH   = j.value("tile_h",        0);
 
-    const auto& size = j["map"]["size"];
-    rows = size[0].get<int>();
-    cols = size[1].get<int>();
+    maps.clear();
 
-    cells.assign(rows, std::vector<int>(cols, 0));
-
-    for (const auto& d : j["map"]["details"]) {
-        const int r  = d[0].get<int>();
-        const int c0 = d[1].get<int>();
-        const int c1 = d[2].get<int>();
-        const int t  = d[3].get<int>();
-
-        if (r < 0 || r >= rows) continue;
-        for (int c = std::max(0, c0); c <= c1 && c < cols; ++c) {
-            cells[r][c] = t;
-        }
+    if (j.contains("maps") && j["maps"].is_array()) {
+        // New multi-map format
+        for (const auto& jm : j["maps"])
+            maps.push_back(LoadMapData(jm));
+        activeMapIdx = j.value("active_map", 0);
+    } else if (j.contains("map")) {
+        // Legacy single-map format — wrap it transparently
+        json jm = j["map"];
+        if (!jm.contains("name")) jm["name"] = "Map 1";
+        maps.push_back(LoadMapData(jm));
+        activeMapIdx = 0;
     }
+
+    if (maps.empty()) {
+        // Fallback: create a blank 20x20 map so the app is always usable
+        AddMap("Map 1", 20, 20);
+        activeMapIdx = 0;
+    }
+
+    if (activeMapIdx < 0 || activeMapIdx >= static_cast<int>(maps.size()))
+        activeMapIdx = 0;
 
     return true;
 }
 
-// Save the current grid calibration values (origin, tile size, base resolution)
-// back to the JSON config file, preserving all other existing fields (map data, etc.).
-// The file is read first so that keys not managed here are not lost.
+// Save calibration values AND all map data back to the JSON config file.
+// Any unrelated keys already in the file are preserved.
 bool Grid::SaveToFile(const std::string& path) const {
     json j;
     {
@@ -79,6 +121,20 @@ bool Grid::SaveToFile(const std::string& path) const {
     j["grid_origin_y"] = originY;
     j["tile_w"]        = tileW;
     j["tile_h"]        = tileH;
+    j["active_map"]    = activeMapIdx;
+
+    // Remove the legacy single-map key if still present
+    j.erase("map");
+
+    json jmaps = json::array();
+    for (const auto& m : maps) {
+        json jm;
+        jm["name"]    = m.name;
+        jm["size"]    = json::array({m.rows, m.cols});
+        jm["details"] = MakeDetails(m);
+        jmaps.push_back(std::move(jm));
+    }
+    j["maps"] = std::move(jmaps);
 
     std::ofstream out(path);
     if (!out) {
@@ -90,18 +146,24 @@ bool Grid::SaveToFile(const std::string& path) const {
 }
 
 bool Grid::IsExisting(int c, int r) const {
-    if (r < 0 || r >= rows || c < 0 || c >= cols) return false;
-    return cells[r][c] != 0;
+    if (maps.empty()) return false;
+    const MapData& m = maps[activeMapIdx];
+    if (r < 0 || r >= m.rows || c < 0 || c >= m.cols) return false;
+    return m.cells[r][c] != 0;
 }
 
 bool Grid::IsWalkable(int c, int r) const {
-    if (r < 0 || r >= rows || c < 0 || c >= cols) return false;
-    return cells[r][c] == 1;
+    if (maps.empty()) return false;
+    const MapData& m = maps[activeMapIdx];
+    if (r < 0 || r >= m.rows || c < 0 || c >= m.cols) return false;
+    return m.cells[r][c] == 1;
 }
 
 bool Grid::BlocksLoS(int c, int r) const {
-    if (r < 0 || r >= rows || c < 0 || c >= cols) return false;
-    return cells[r][c] == 2;
+    if (maps.empty()) return false;
+    const MapData& m = maps[activeMapIdx];
+    if (r < 0 || r >= m.rows || c < 0 || c >= m.cols) return false;
+    return m.cells[r][c] == 2;
 }
 
 // DDA (Digital Differential Analyzer) raycast from cell center a to cell center b.
@@ -162,15 +224,16 @@ bool Grid::HasLineOfSight(Cell a, Cell b) const {
 }
 
 void Grid::DrawNoLoSOverlay(Cell from) const {
-    if (tileW <= 0 || tileH <= 0) return;
+    if (tileW <= 0 || tileH <= 0 || maps.empty()) return;
 
-    const ImU32 fill = IM_COL32(0, 0, 0, 110);
-    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    const MapData& m   = maps[activeMapIdx];
+    const ImU32    fill = IM_COL32(0, 0, 0, 110);
+    ImDrawList*    dl   = ImGui::GetBackgroundDrawList();
     ImVec2 q[4];
 
-    for (int r = 0; r < rows; ++r) {
-        for (int c = 0; c < cols; ++c) {
-            if (!IsWalkable(c, r)) continue;
+    for (int r = 0; r < m.rows; ++r) {
+        for (int c = 0; c < m.cols; ++c) {
+            if (m.cells[r][c] != 1) continue;
             const Cell here{ c, r };
             if (here == from) continue;
             if (HasLineOfSight(from, here)) continue;
@@ -217,14 +280,14 @@ ImVec2 Grid::CellCenter(int c, int r) const {
 
 // Pick the walkable cell at the given screen position by testing each cell with
 // the diamond containment formula: |dx/halfW| + |dy/halfH| <= 1.
-// Iterates over all cells; this is acceptable for the small maps used here.
 std::optional<Cell> Grid::PickCell(ImVec2 screenPos) const {
     const Transform t = CurrentTransform();
-    if (t.halfW <= 0.0f || t.halfH <= 0.0f) return std::nullopt;
+    if (t.halfW <= 0.0f || t.halfH <= 0.0f || maps.empty()) return std::nullopt;
 
-    for (int r = 0; r < rows; ++r) {
-        for (int c = 0; c < cols; ++c) {
-            if (!IsWalkable(c, r)) continue;
+    const MapData& m = maps[activeMapIdx];
+    for (int r = 0; r < m.rows; ++r) {
+        for (int c = 0; c < m.cols; ++c) {
+            if (m.cells[r][c] != 1) continue;
             const float cx = t.ox + (c - r) * t.halfW;
             const float cy = t.oy + (c + r) * t.halfH;
             const float dx = std::fabs(screenPos.x - cx);
@@ -237,28 +300,94 @@ std::optional<Cell> Grid::PickCell(ImVec2 screenPos) const {
     return std::nullopt;
 }
 
-void Grid::Draw() const {
-    if (tileW <= 0 || tileH <= 0) return;
+// Pick any in-bounds cell using the analytic inverse of the isometric transform.
+// Works for non-existing cells too (needed for draw mode painting).
+std::optional<Cell> Grid::PickAnyCell(ImVec2 screenPos) const {
+    const Transform t = CurrentTransform();
+    if (t.halfW <= 0.0f || t.halfH <= 0.0f || maps.empty()) return std::nullopt;
 
+    const MapData& m = maps[activeMapIdx];
+    const float ndx = (screenPos.x - t.ox) / t.halfW;
+    const float ndy = (screenPos.y - t.oy) / t.halfH;
+
+    const int ic = static_cast<int>(std::round((ndx + ndy) * 0.5f));
+    const int ir = static_cast<int>(std::round((ndy - ndx) * 0.5f));
+
+    if (ic < 0 || ic >= m.cols || ir < 0 || ir >= m.rows) return std::nullopt;
+    return Cell{ic, ir};
+}
+
+void Grid::Draw() const {
+    if (tileW <= 0 || tileH <= 0 || maps.empty()) return;
+
+    const MapData& m = maps[activeMapIdx];
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
 
     const ImU32 walkableLine = IM_COL32(255, 255, 255, 45);
-    const ImU32 blockedLine  = IM_COL32(200, 200, 200, 150);
-    const ImU32 blockedFill  = IM_COL32(40, 40, 40, 180);
 
+    // Pass 1: walkable floor cells
     ImVec2 q[4];
-    for (int r = 0; r < rows; ++r) {
-        for (int c = 0; c < cols; ++c) {
-            const int t = cells[r][c];
-            if (t == 0) continue;
-
+    for (int r = 0; r < m.rows; ++r) {
+        for (int c = 0; c < m.cols; ++c) {
+            if (m.cells[r][c] != 1) continue;
             Diamond(c, r, q);
-            if (t == 2) {
-                dl->AddQuadFilled(q[0], q[1], q[2], q[3], blockedFill);
-                dl->AddQuad(q[0], q[1], q[2], q[3], blockedLine, 1.0f);
-            } else {
-                dl->AddQuad(q[0], q[1], q[2], q[3], walkableLine, 1.0f);
+            dl->AddQuad(q[0], q[1], q[2], q[3], walkableLine, 1.0f);
+        }
+    }
+
+    // Pass 2: LoS-blocker cubes — drawn in painter's order (increasing r+c)
+    for (int depth = 0; depth < m.rows + m.cols - 1; ++depth) {
+        for (int r = std::max(0, depth - m.cols + 1); r <= depth && r < m.rows; ++r) {
+            const int c = depth - r;
+            if (c < 0 || c >= m.cols) continue;
+            if (m.cells[r][c] != 2) continue;
+            DrawCube(c, r,
+                IM_COL32( 70,  70,  90, 230),   // top   — grey-blue lit
+                IM_COL32( 25,  25,  40, 235),   // left  — darkest (shadow)
+                IM_COL32( 50,  50,  70, 230),   // right — medium shadow
+                IM_COL32(190, 190, 210, 150));  // outline
+        }
+    }
+}
+
+// Draw-mode overlay: renders every cell in the bounding box with a color
+// that indicates its current type, so the user can see what they're painting.
+void Grid::DrawEditOverlay() const {
+    if (tileW <= 0 || tileH <= 0 || maps.empty()) return;
+
+    const MapData& m = maps[activeMapIdx];
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+
+    const ImU32 emptyOutline    = IM_COL32(100, 100, 100,  60);
+    const ImU32 walkableFill    = IM_COL32(  0, 180,   0,  50);
+    const ImU32 walkableOutline = IM_COL32(  0, 255,   0, 160);
+
+    // Pass 1: empty grid cells + walkable cells
+    ImVec2 q[4];
+    for (int r = 0; r < m.rows; ++r) {
+        for (int c = 0; c < m.cols; ++c) {
+            Diamond(c, r, q);
+            const int type = m.cells[r][c];
+            if (type == 1) {
+                dl->AddQuadFilled(q[0], q[1], q[2], q[3], walkableFill);
+                dl->AddQuad(q[0], q[1], q[2], q[3], walkableOutline, 1.5f);
+            } else if (type != 2) {
+                dl->AddQuad(q[0], q[1], q[2], q[3], emptyOutline, 1.0f);
             }
+        }
+    }
+
+    // Pass 2: LoS-blocker cubes in painter's order
+    for (int depth = 0; depth < m.rows + m.cols - 1; ++depth) {
+        for (int r = std::max(0, depth - m.cols + 1); r <= depth && r < m.rows; ++r) {
+            const int c = depth - r;
+            if (c < 0 || c >= m.cols) continue;
+            if (m.cells[r][c] != 2) continue;
+            DrawCube(c, r,
+                IM_COL32(200, 100,   0, 190),   // top   — amber lit
+                IM_COL32(120,  50,   0, 210),   // left  — dark amber shadow
+                IM_COL32(160,  75,   0, 200),   // right — medium amber
+                IM_COL32(255, 160,   0, 200));  // outline
         }
     }
 }
@@ -292,6 +421,85 @@ void Grid::DrawCellLine(int c0, int r0, int c1, int r1, ImU32 color, float thick
     ImGui::GetBackgroundDrawList()->AddLine(a, b, color, thickness);
 }
 
+// Draw an isometric cube at cell (c, r).
+// The cube top face is the normal diamond shifted UP by cubeH pixels.
+// Two side faces (left-bottom and right-bottom) complete the 3D illusion.
+//   top[0..3] = diamond corners shifted up by cubeH
+//   Left face  = floor[left], floor[bottom], top[bottom], top[left]
+//   Right face = floor[right], floor[bottom], top[bottom], top[right]
+void Grid::DrawCube(int c, int r,
+                    ImU32 topFill, ImU32 leftFill, ImU32 rightFill,
+                    ImU32 outline) const {
+    const Transform t = CurrentTransform();
+    const float cx = t.ox + (c - r) * t.halfW;
+    const float cy = t.oy + (c + r) * t.halfH;
+
+    // Cube height in screen pixels (half tile height)
+    const float cubeH = t.halfH;
+
+    // Floor diamond corners
+    const ImVec2 fTop    = {cx,             cy - t.halfH};
+    const ImVec2 fRight  = {cx + t.halfW,   cy          };
+    const ImVec2 fBottom = {cx,             cy + t.halfH};
+    const ImVec2 fLeft   = {cx - t.halfW,   cy          };
+    (void)fTop; // top floor corner not needed for sides
+
+    // Top face = floor diamond shifted up
+    const ImVec2 tTop    = {cx,             cy - t.halfH - cubeH};
+    const ImVec2 tRight  = {cx + t.halfW,   cy           - cubeH};
+    const ImVec2 tBottom = {cx,             cy + t.halfH - cubeH};
+    const ImVec2 tLeft   = {cx - t.halfW,   cy           - cubeH};
+
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+
+    // Left face (shadow side)
+    dl->AddQuadFilled(fLeft, fBottom, tBottom, tLeft, leftFill);
+    if (outline) dl->AddQuad(fLeft, fBottom, tBottom, tLeft, outline, 1.0f);
+
+    // Right face (mid-shadow side)
+    dl->AddQuadFilled(fRight, fBottom, tBottom, tRight, rightFill);
+    if (outline) dl->AddQuad(fRight, fBottom, tBottom, tRight, outline, 1.0f);
+
+    // Top face (lit)
+    dl->AddQuadFilled(tTop, tRight, tBottom, tLeft, topFill);
+    if (outline) dl->AddQuad(tTop, tRight, tBottom, tLeft, outline, 1.5f);
+}
+
+// Show a semi-transparent preview of what the cell under the cursor would
+// become after a left-click (cycle: 0 → 1 → 2 → 0).
+void Grid::DrawHoverPreview(Cell hovered) const {
+    if (tileW <= 0 || tileH <= 0 || maps.empty()) return;
+
+    const int current = GetCellType(hovered.c, hovered.r);
+    const int next    = (current + 1) % 3;
+
+    ImVec2 q[4];
+    Diamond(hovered.c, hovered.r, q);
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+
+    if (next == 0) {
+        // Would become empty — dim red to signal deletion
+        dl->AddQuadFilled(q[0], q[1], q[2], q[3], IM_COL32(220,  40,  40,  70));
+        dl->AddQuad      (q[0], q[1], q[2], q[3], IM_COL32(255,  80,  80, 220), 2.0f);
+        // Draw a small X at the center
+        const ImVec2 ctr = CellCenter(hovered.c, hovered.r);
+        const float  s   = 8.0f;
+        dl->AddLine({ctr.x - s, ctr.y - s}, {ctr.x + s, ctr.y + s}, IM_COL32(255, 80, 80, 230), 2.0f);
+        dl->AddLine({ctr.x + s, ctr.y - s}, {ctr.x - s, ctr.y + s}, IM_COL32(255, 80, 80, 230), 2.0f);
+    } else if (next == 1) {
+        // Would become walkable — green tint
+        dl->AddQuadFilled(q[0], q[1], q[2], q[3], IM_COL32(  0, 220,   0,  70));
+        dl->AddQuad      (q[0], q[1], q[2], q[3], IM_COL32(  0, 255,   0, 220), 2.0f);
+    } else {
+        // Would become LoS blocker — preview cube in semi-transparent amber
+        DrawCube(hovered.c, hovered.r,
+            IM_COL32(220, 120,   0, 120),
+            IM_COL32(140,  60,   0, 130),
+            IM_COL32(180,  90,   0, 125),
+            IM_COL32(255, 180,   0, 180));
+    }
+}
+
 // Resize the tile dimensions while keeping the isometric 2:1 aspect ratio
 // (tileW = 2 * tileH). A minimum size is enforced to keep cells visible.
 void Grid::ResizeTile(int step) {
@@ -301,4 +509,90 @@ void Grid::ResizeTile(int step) {
     if (newH < 6)  newH = 6;
     tileW = newW;
     tileH = newH;
+}
+
+// ---- Active-map dimension accessors ----
+
+int Grid::Rows() const {
+    if (maps.empty()) return 0;
+    return maps[activeMapIdx].rows;
+}
+
+int Grid::Cols() const {
+    if (maps.empty()) return 0;
+    return maps[activeMapIdx].cols;
+}
+
+// ---- Multi-map management ----
+
+const std::string& Grid::MapName(int idx) const {
+    static const std::string empty;
+    if (idx < 0 || idx >= static_cast<int>(maps.size())) return empty;
+    return maps[idx].name;
+}
+
+bool Grid::SwitchToMap(int idx) {
+    if (idx < 0 || idx >= static_cast<int>(maps.size())) return false;
+    activeMapIdx = idx;
+    return true;
+}
+
+void Grid::AddMap(const std::string& name, int rows, int cols) {
+    MapData m;
+    m.name = name;
+    m.rows = rows;
+    m.cols = cols;
+    m.cells.assign(rows, std::vector<int>(cols, 0));
+    maps.push_back(std::move(m));
+}
+
+void Grid::DeleteMap(int idx) {
+    if (idx < 0 || idx >= static_cast<int>(maps.size())) return;
+    if (static_cast<int>(maps.size()) <= 1) return; // always keep at least one map
+    maps.erase(maps.begin() + idx);
+    if (activeMapIdx >= static_cast<int>(maps.size()))
+        activeMapIdx = static_cast<int>(maps.size()) - 1;
+}
+
+void Grid::RenameMap(int idx, const std::string& name) {
+    if (idx < 0 || idx >= static_cast<int>(maps.size())) return;
+    maps[idx].name = name;
+}
+
+// ---- Draw-mode cell editing ----
+
+void Grid::SetCellType(int c, int r, int type) {
+    if (maps.empty()) return;
+    MapData& m = maps[activeMapIdx];
+    if (r < 0 || r >= m.rows || c < 0 || c >= m.cols) return;
+    m.cells[r][c] = type;
+}
+
+int Grid::GetCellType(int c, int r) const {
+    if (maps.empty()) return 0;
+    const MapData& m = maps[activeMapIdx];
+    if (r < 0 || r >= m.rows || c < 0 || c >= m.cols) return 0;
+    return m.cells[r][c];
+}
+
+// Resize the active map's bounding box.
+// New rows/cols are filled with type 0 (non-existing); existing cells are kept.
+Grid::GridSnapshot Grid::GetGridSnapshot() const {
+    return { maps, activeMapIdx };
+}
+
+void Grid::RestoreGridSnapshot(const GridSnapshot& snapshot) {
+    maps         = snapshot.maps;
+    activeMapIdx = snapshot.activeIdx;
+}
+
+void Grid::ResizeGrid(int newRows, int newCols) {
+    if (maps.empty()) return;
+    if (newRows < 1) newRows = 1;
+    if (newCols < 1) newCols = 1;
+    MapData& m = maps[activeMapIdx];
+    m.cells.resize(newRows, std::vector<int>(newCols, 0));
+    for (auto& row : m.cells) row.resize(newCols, 0);
+    m.rows = newRows;
+    m.cols = newCols;
 }
