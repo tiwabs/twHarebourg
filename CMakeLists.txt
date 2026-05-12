@@ -35,6 +35,14 @@ find_package(OpenGL REQUIRED)
 # --- Executable ---
 add_executable(${PROJECT_NAME}
     src/main.cpp
+    src/app.cpp
+    src/overlay_window.cpp
+    src/control_window.cpp
+    src/hotkey_manager.cpp
+    src/placement_mode.cpp
+    src/draw_mode.cpp
+    src/grid_edit_mode.cpp
+    src/ui_panel.cpp
     src/grid.cpp
     src/logic.cpp
 )
